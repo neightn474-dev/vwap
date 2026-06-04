@@ -1,0 +1,307 @@
+//@version=6
+indicator("Long-Term Investment Intelligence Screener", shorttitle="LT IIS", overlay=true, max_labels_count=50)
+
+// -----------------------------------------------------------------------------
+// Long-Term Investment Intelligence Screener
+// Fundamental-first, technical-confirmed, risk-gated stock research assistant.
+//
+// Pine cannot fetch arbitrary live news, SEC filings, funding events, or
+// geopolitical intelligence. Those inputs are modeled as manual/external-review
+// controls so a verified outside workflow can influence the final intent.
+// -----------------------------------------------------------------------------
+
+// === Inputs ==================================================================
+benchmarkSymbol = input.symbol("SPY", "Relative strength benchmark")
+useQqqBenchmark = input.bool(false, "Use QQQ instead of benchmark")
+qqqSymbol = input.symbol("QQQ", "QQQ benchmark")
+
+riskProfile = input.string("Balanced-Conservative", "Risk profile", options=["Conservative", "Balanced-Conservative", "Balanced", "Aggressive"])
+valuationMode = input.string("Balanced", "Valuation strictness", options=["Strict", "Balanced", "Flexible Growth"])
+
+showDashboard = input.bool(true, "Show dashboard")
+showSignals = input.bool(true, "Show intent markers")
+showMovingAverages = input.bool(true, "Show 50/200 SMA")
+
+// External intelligence inputs. Set after reviewing filings/news outside Pine.
+externalDataConfidence = input.string("Medium", "External data confidence", options=["High", "Medium", "Low", "Manual Review"])
+externalNewsScore = input.int(0, "Recent news/catalyst score (-3 to +3)", minval=-3, maxval=3)
+externalFilingRisk = input.string("None", "SEC/material filing risk", options=["None", "Low", "Moderate", "High", "Severe"])
+externalFundingRisk = input.string("None", "Funding/dilution risk", options=["None", "Low", "Moderate", "High", "Severe"])
+externalGeoRisk = input.string("Low", "Geopolitical/sector risk", options=["Low", "Moderate", "High", "Severe"])
+externalMacroRisk = input.string("Neutral", "Macro backdrop", options=["Tailwind", "Neutral", "Headwind", "Severe Headwind"])
+
+// Technical tuning.
+rsLookback = input.int(126, "Relative strength lookback", minval=21, maxval=252)
+overextendedFrom200Pct = input.float(35.0, "Overextended above 200 SMA (%)", minval=5.0, maxval=100.0, step=1.0)
+pullbackTo50Pct = input.float(5.0, "Healthy pullback distance to 50 SMA (%)", minval=1.0, maxval=20.0, step=0.5)
+volumeLookback = input.int(50, "Volume/accumulation lookback", minval=10, maxval=200)
+
+// === Helpers =================================================================
+scoreBool(condition, points) => condition ? points : 0.0
+nz0(value) => na(value) ? 0.0 : value
+isPresent(value) => not na(value)
+clamp(value, lo, hi) => math.max(lo, math.min(hi, value))
+
+riskToPenalty(risk) =>
+    switch risk
+        "None" => 0
+        "Low" => 1
+        "Moderate" => 2
+        "High" => 3
+        "Severe" => 4
+        => 0
+
+geoToPenalty(risk) =>
+    switch risk
+        "Low" => 0
+        "Moderate" => 1
+        "High" => 2
+        "Severe" => 3
+        => 0
+
+macroToPenalty(risk) =>
+    switch risk
+        "Tailwind" => -1
+        "Neutral" => 0
+        "Headwind" => 1
+        "Severe Headwind" => 3
+        => 0
+
+dataConfidenceCode(confidence) =>
+    switch confidence
+        "High" => 3
+        "Medium" => 2
+        "Manual Review" => 1
+        "Low" => 0
+        => 1
+
+fmtScore(value) => str.tostring(math.round(value), "#")
+
+// === Fundamental data from TradingView =======================================
+// Availability varies by symbol/exchange. Missing values are penalized through
+// the data-confidence and red-flag logic.
+revenueTtm = request.financial(syminfo.tickerid, "TOTAL_REVENUE", "TTM", ignore_invalid_symbol=true)
+revenueFy = request.financial(syminfo.tickerid, "TOTAL_REVENUE", "FY", ignore_invalid_symbol=true)
+netIncomeTtm = request.financial(syminfo.tickerid, "NET_INCOME", "TTM", ignore_invalid_symbol=true)
+freeCashFlowTtm = request.financial(syminfo.tickerid, "FREE_CASH_FLOW", "TTM", ignore_invalid_symbol=true)
+totalDebtFq = request.financial(syminfo.tickerid, "TOTAL_DEBT", "FQ", ignore_invalid_symbol=true)
+totalEquityFq = request.financial(syminfo.tickerid, "TOTAL_EQUITY", "FQ", ignore_invalid_symbol=true)
+totalSharesFq = request.financial(syminfo.tickerid, "TOTAL_SHARES_OUTSTANDING", "FQ", ignore_invalid_symbol=true)
+bookValuePerShareFq = request.financial(syminfo.tickerid, "BOOK_VALUE_PER_SHARE", "FQ", ignore_invalid_symbol=true)
+currentRatioFq = request.financial(syminfo.tickerid, "CURRENT_RATIO", "FQ", ignore_invalid_symbol=true)
+epsBasicTtm = request.financial(syminfo.tickerid, "EARNINGS_PER_SHARE_BASIC", "TTM", ignore_invalid_symbol=true)
+revenueGrowth = request.financial(syminfo.tickerid, "REVENUE_ONE_YEAR_GROWTH", "TTM", ignore_invalid_symbol=true)
+debtToEquity = request.financial(syminfo.tickerid, "DEBT_TO_EQUITY", "FQ", ignore_invalid_symbol=true)
+netMargin = request.financial(syminfo.tickerid, "NET_MARGIN", "TTM", ignore_invalid_symbol=true)
+roe = request.financial(syminfo.tickerid, "RETURN_ON_EQUITY", "FQ", ignore_invalid_symbol=true)
+
+marketCap = isPresent(totalSharesFq) ? totalSharesFq * close : na
+peRatio = isPresent(epsBasicTtm) and epsBasicTtm > 0 ? close / epsBasicTtm : na
+psRatio = isPresent(marketCap) and isPresent(revenueTtm) and revenueTtm > 0 ? marketCap / revenueTtm : na
+pbRatio = isPresent(bookValuePerShareFq) and bookValuePerShareFq > 0 ? close / bookValuePerShareFq : na
+earningsYield = isPresent(epsBasicTtm) and epsBasicTtm > 0 ? epsBasicTtm / close * 100.0 : na
+
+availableFundamentalFields =
+     scoreBool(isPresent(revenueTtm), 1) + scoreBool(isPresent(netIncomeTtm), 1) +
+     scoreBool(isPresent(freeCashFlowTtm), 1) + scoreBool(isPresent(totalDebtFq), 1) +
+     scoreBool(isPresent(totalEquityFq), 1) + scoreBool(isPresent(totalSharesFq), 1) +
+     scoreBool(isPresent(epsBasicTtm), 1) + scoreBool(isPresent(bookValuePerShareFq), 1) +
+     scoreBool(isPresent(netMargin), 1) + scoreBool(isPresent(roe), 1)
+internalDataConfidence = availableFundamentalFields >= 8 ? 3 : availableFundamentalFields >= 6 ? 2 : availableFundamentalFields >= 4 ? 1 : 0
+combinedDataConfidence = math.min(internalDataConfidence, dataConfidenceCode(externalDataConfidence))
+
+// === Business quality score: 25 points =======================================
+businessScore =
+     scoreBool(netIncomeTtm > 0, 5) +
+     scoreBool(freeCashFlowTtm > 0, 6) +
+     scoreBool(netMargin > 0, 3) +
+     scoreBool(netMargin >= 10, 4) +
+     scoreBool(roe > 0, 3) +
+     scoreBool(roe >= 15, 4)
+businessScore := clamp(businessScore, 0, 25)
+
+// === Growth score: 15 points =================================================
+growthScore =
+     scoreBool(revenueGrowth > 0, 5) +
+     scoreBool(revenueGrowth >= 10, 4) +
+     scoreBool(epsBasicTtm > 0, 3) +
+     scoreBool(freeCashFlowTtm > 0 and revenueGrowth > 0, 3)
+growthScore := clamp(growthScore, 0, 15)
+
+// === Balance sheet score: 15 points ==========================================
+balanceScore =
+     scoreBool(debtToEquity >= 0 and debtToEquity <= 1.5, 5) +
+     scoreBool(debtToEquity >= 0 and debtToEquity <= 0.75, 3) +
+     scoreBool(currentRatioFq >= 1, 3) +
+     scoreBool(totalEquityFq > 0, 2) +
+     scoreBool(freeCashFlowTtm > 0, 2)
+balanceScore := clamp(balanceScore, 0, 15)
+
+// === Valuation score: 15 points ==============================================
+peReasonableStrict = peRatio > 0 and peRatio <= 25
+peReasonableBalanced = peRatio > 0 and peRatio <= 35
+peReasonableFlexible = peRatio > 0 and (peRatio <= 45 or revenueGrowth >= 20)
+peReasonable = valuationMode == "Strict" ? peReasonableStrict : valuationMode == "Flexible Growth" ? peReasonableFlexible : peReasonableBalanced
+psReasonable = valuationMode == "Strict" ? psRatio > 0 and psRatio <= 5 : valuationMode == "Flexible Growth" ? psRatio > 0 and (psRatio <= 12 or revenueGrowth >= 20) : psRatio > 0 and psRatio <= 8
+pbReasonable = pbRatio > 0 and pbRatio <= 8
+valuationScore =
+     scoreBool(peRatio > 0, 3) +
+     scoreBool(peReasonable, 4) +
+     scoreBool(psReasonable, 3) +
+     scoreBool(pbReasonable, 2) +
+     scoreBool(earningsYield >= 3, 2) +
+     scoreBool(revenueGrowth >= 10 and peRatio > 0 and peRatio <= 40, 1)
+valuationScore := clamp(valuationScore, 0, 15)
+
+// === Technical confirmation score: 15 points =================================
+sma50 = ta.sma(close, 50)
+sma200 = ta.sma(close, 200)
+benchmark = useQqqBenchmark ? qqqSymbol : benchmarkSymbol
+benchmarkClose = request.security(benchmark, timeframe.period, close, ignore_invalid_symbol=true)
+stockReturn = close[rsLookback] != 0 ? (close - close[rsLookback]) / close[rsLookback] * 100.0 : na
+benchmarkReturn = benchmarkClose[rsLookback] != 0 ? (benchmarkClose - benchmarkClose[rsLookback]) / benchmarkClose[rsLookback] * 100.0 : na
+relativeStrength = isPresent(stockReturn) and isPresent(benchmarkReturn) ? stockReturn - benchmarkReturn : na
+
+bullVolume = close > open ? volume : 0.0
+bearVolume = close < open ? volume : 0.0
+bullVolumeSum = math.sum(bullVolume, volumeLookback)
+bearVolumeSum = math.sum(bearVolume, volumeLookback)
+avgVolume = ta.sma(volume, volumeLookback)
+volumeAccumulation = bullVolumeSum > bearVolumeSum
+breakoutVolume = close > ta.highest(high, 50)[1] and volume > avgVolume * 1.3
+
+distanceFrom200Pct = isPresent(sma200) and sma200 != 0 ? (close - sma200) / sma200 * 100.0 : na
+distanceFrom50Pct = isPresent(sma50) and sma50 != 0 ? math.abs(close - sma50) / sma50 * 100.0 : na
+overextended = distanceFrom200Pct > overextendedFrom200Pct or (distanceFrom50Pct > 20 and close > sma50)
+healthyPullback = close > sma200 and sma50 > sma200 and close <= sma50 * (1 + pullbackTo50Pct / 100.0) and close >= sma200
+
+technicalScore =
+     scoreBool(close > sma200, 4) +
+     scoreBool(sma50 > sma200, 3) +
+     scoreBool(close > sma50, 2) +
+     scoreBool(relativeStrength > 0, 3) +
+     scoreBool(not overextended and close > sma200, 2) +
+     scoreBool(volumeAccumulation or breakoutVolume, 1)
+technicalScore := clamp(technicalScore, 0, 15)
+
+// === Event/catalyst layer: 10 adjustment points ==============================
+filingPenalty = riskToPenalty(externalFilingRisk)
+fundingPenalty = riskToPenalty(externalFundingRisk)
+geoPenalty = geoToPenalty(externalGeoRisk)
+macroPenalty = macroToPenalty(externalMacroRisk)
+eventScore = clamp(5 + externalNewsScore - filingPenalty - fundingPenalty - geoPenalty - macroPenalty, 0, 10)
+
+// === Red flags and gates ======================================================
+weakBusiness = businessScore < 10 or (netIncomeTtm < 0 and freeCashFlowTtm < 0)
+dangerousBalance = balanceScore < 5 or (debtToEquity > 3 and freeCashFlowTtm <= 0) or totalEquityFq < 0
+excessiveValuation = valuationScore < 4 or (peRatio > 80 and revenueGrowth < 10) or (psRatio > 15 and freeCashFlowTtm <= 0)
+weakTechnical = technicalScore < 5 or (close < sma200 and relativeStrength < 0)
+severeEventRisk = externalFilingRisk == "Severe" or externalFundingRisk == "Severe" or externalGeoRisk == "Severe" or externalMacroRisk == "Severe Headwind" or externalNewsScore <= -3
+lowDataConfidence = combinedDataConfidence == 0
+manualReviewData = externalDataConfidence == "Manual Review"
+
+redFlags =
+     scoreBool(lowDataConfidence, 1) + scoreBool(manualReviewData, 1) + scoreBool(weakBusiness, 1) +
+     scoreBool(dangerousBalance, 1) + scoreBool(excessiveValuation, 1) + scoreBool(weakTechnical, 1) +
+     scoreBool(severeEventRisk, 1) + scoreBool(revenueGrowth < 0, 1) + scoreBool(overextended, 1)
+
+researchScore = clamp(businessScore + growthScore + balanceScore + valuationScore + technicalScore + eventScore, 0, 100)
+baseIntentScore = researchScore / 10.0
+buyIntentScore = clamp(baseIntentScore - redFlags * 1.25 + scoreBool(healthyPullback, 1.0) + scoreBool(breakoutVolume, 0.5), 0, 10)
+
+// Intent codes: 6 Buy Zone, 5 Investable, 4 Wait Pullback, 3 Watchlist,
+// 2 Speculative/Manual Review, 1 Avoid.
+canBuyZone = researchScore >= 75 and buyIntentScore >= 8 and businessScore >= 15 and balanceScore >= 7 and valuationScore >= 5 and technicalScore >= 9 and relativeStrength > 0 and redFlags <= 1 and not lowDataConfidence and not severeEventRisk
+canInvestable = researchScore >= 80 and businessScore >= 15 and balanceScore >= 7 and valuationScore >= 5 and technicalScore >= 9 and not severeEventRisk and not lowDataConfidence
+mustManualReview = manualReviewData or combinedDataConfidence <= 1 or severeEventRisk or externalFilingRisk == "High" or externalFundingRisk == "High"
+shouldAvoid = researchScore < 50 or weakBusiness or dangerousBalance or (weakTechnical and relativeStrength < 0) or (excessiveValuation and growthScore < 7)
+waitPullback = researchScore >= 75 and businessScore >= 15 and technicalScore >= 9 and overextended and not shouldAvoid
+watchlist = researchScore >= 65 and not shouldAvoid
+
+intentCode = canBuyZone ? 6 : canInvestable ? 5 : waitPullback ? 4 : mustManualReview ? 2 : watchlist ? 3 : shouldAvoid ? 1 : 2
+intentText =
+    switch intentCode
+        6 => "BUY ZONE"
+        5 => "INVESTABLE"
+        4 => "WAIT PULLBACK"
+        3 => "WATCHLIST"
+        2 => "MANUAL REVIEW"
+        1 => "AVOID"
+        => "MANUAL REVIEW"
+
+riskCode = weakBusiness ? 1 : dangerousBalance ? 2 : excessiveValuation ? 3 : weakTechnical ? 4 : severeEventRisk ? 5 : lowDataConfidence ? 6 : overextended ? 7 : 0
+riskText =
+    switch riskCode
+        1 => "Weak business"
+        2 => "Balance sheet risk"
+        3 => "Valuation risk"
+        4 => "Weak technicals"
+        5 => "Event risk"
+        6 => "Low data confidence"
+        7 => "Overextended"
+        => "No major issue"
+
+entryCode = healthyPullback ? 3 : breakoutVolume ? 2 : overextended ? 4 : close > sma200 and sma50 > sma200 ? 1 : 0
+entryText =
+    switch entryCode
+        3 => "Healthy pullback"
+        2 => "Breakout volume"
+        4 => "Wait for pullback"
+        1 => "Confirmed uptrend"
+        => "No entry edge"
+
+// === Screener-compatible plots ===============================================
+plot(researchScore, "Research Score", display=display.data_window)
+plot(buyIntentScore, "Buy Intent Score", display=display.data_window)
+plot(intentCode, "Intent Code", display=display.data_window)
+plot(redFlags, "Red Flag Count", display=display.data_window)
+plot(combinedDataConfidence, "Data Confidence Code", display=display.data_window)
+plot(businessScore, "Business Quality Score", display=display.data_window)
+plot(growthScore, "Growth Score", display=display.data_window)
+plot(balanceScore, "Balance Sheet Score", display=display.data_window)
+plot(valuationScore, "Valuation Score", display=display.data_window)
+plot(technicalScore, "Technical Score", display=display.data_window)
+plot(eventScore, "External Event Score", display=display.data_window)
+plot(riskCode, "Risk Code", display=display.data_window)
+plot(entryCode, "Entry Code", display=display.data_window)
+
+plot(showMovingAverages ? sma50 : na, "50 SMA", color=color.new(color.blue, 0), linewidth=1)
+plot(showMovingAverages ? sma200 : na, "200 SMA", color=color.new(color.orange, 0), linewidth=2)
+
+signalColor = intentCode == 6 ? color.new(color.green, 0) : intentCode == 5 ? color.new(color.teal, 0) : intentCode == 4 ? color.new(color.orange, 0) : intentCode == 3 ? color.new(color.blue, 0) : intentCode == 2 ? color.new(color.purple, 0) : color.new(color.red, 0)
+plotshape(showSignals and intentCode == 6 and intentCode[1] != 6, title="Buy Zone", style=shape.labelup, text="BUY ZONE", location=location.belowbar, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+plotshape(showSignals and intentCode == 4 and intentCode[1] != 4, title="Wait Pullback", style=shape.labeldown, text="WAIT", location=location.abovebar, color=color.new(color.orange, 0), textcolor=color.white, size=size.small)
+
+alertcondition(intentCode == 6 and intentCode[1] != 6, "Buy Zone reached", "{{ticker}} reached Long-Term Buy Zone. Verify filings/news before investing.")
+alertcondition(intentCode == 5 and intentCode[1] != 5, "Investable candidate", "{{ticker}} became an Investable Candidate. Check entry and external risks.")
+alertcondition(redFlags >= 3 and redFlags[1] < 3, "Red flags elevated", "{{ticker}} has elevated red flags in the Long-Term Investment Intelligence Screener.")
+
+// === Dashboard ================================================================
+var table dashboard = table.new(position.top_right, 2, 13, border_width=1)
+if showDashboard and barstate.islast
+    table.cell(dashboard, 0, 0, "LT INVESTMENT INTELLIGENCE", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dashboard, 1, 0, syminfo.ticker, text_color=color.white, bgcolor=signalColor)
+    table.cell(dashboard, 0, 1, "Research Score")
+    table.cell(dashboard, 1, 1, fmtScore(researchScore) + " / 100", text_color=signalColor)
+    table.cell(dashboard, 0, 2, "Buy Intent")
+    table.cell(dashboard, 1, 2, str.tostring(buyIntentScore, "#.0") + " / 10")
+    table.cell(dashboard, 0, 3, "Final Intent")
+    table.cell(dashboard, 1, 3, intentText, text_color=color.white, bgcolor=signalColor)
+    table.cell(dashboard, 0, 4, "Business / Growth")
+    table.cell(dashboard, 1, 4, fmtScore(businessScore) + "/25 | " + fmtScore(growthScore) + "/15")
+    table.cell(dashboard, 0, 5, "Balance / Valuation")
+    table.cell(dashboard, 1, 5, fmtScore(balanceScore) + "/15 | " + fmtScore(valuationScore) + "/15")
+    table.cell(dashboard, 0, 6, "Technical / Event")
+    table.cell(dashboard, 1, 6, fmtScore(technicalScore) + "/15 | " + fmtScore(eventScore) + "/10")
+    table.cell(dashboard, 0, 7, "Entry")
+    table.cell(dashboard, 1, 7, entryText)
+    table.cell(dashboard, 0, 8, "Primary Risk")
+    table.cell(dashboard, 1, 8, riskText)
+    table.cell(dashboard, 0, 9, "Red Flags")
+    table.cell(dashboard, 1, 9, str.tostring(redFlags, "#"))
+    table.cell(dashboard, 0, 10, "Data Confidence")
+    table.cell(dashboard, 1, 10, str.tostring(combinedDataConfidence) + " / 3")
+    table.cell(dashboard, 0, 11, "Rel Strength")
+    table.cell(dashboard, 1, 11, isPresent(relativeStrength) ? str.tostring(relativeStrength, "#.0") + "% vs " + benchmark : "n/a")
+    table.cell(dashboard, 0, 12, "External Review")
+    table.cell(dashboard, 1, 12, "News " + str.tostring(externalNewsScore) + " | Filing " + externalFilingRisk + " | Funding " + externalFundingRisk)
